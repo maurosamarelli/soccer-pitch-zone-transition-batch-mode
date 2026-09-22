@@ -1,12 +1,127 @@
-# Title: soccer-pitch-zone-transition-batch-mode
-Evaluate a football match by sequences of ball and players movements segragated on different pitch zones when all data are already available (batch mode)
+# soccer-pitch-zone-transition-batch-mode
 
-**Data source:** IDSSE data (2022-2023 Bundesliga / 2. Bundesliga)
-<br/>**Tracking source:** TRACAB (25 FPS)
-<br/>**Number of matches:** 7
-<br/>**Categories:** match information, ball events, ball and players tracking 
-<br/>**File format:** nested XML structure converted in JSONL with a preliminary step
-<br/>**Architecture:** AWS S3 storage + Declarative Lakehouse Tables Pipeline on Databricks
+Evaluate a football match by sequences of ball and players movements segregated on different pitch zones when all data are already available (batch mode).
+
+**Data source:** IDSSE data (2022-2023 Bundesliga / 2. Bundesliga)  
+**Tracking source:** TRACAB (25 FPS)  
+**Number of matches:** 7  
+**Categories:** match information, ball events, ball and players tracking  
+**File format:** nested XML structure converted in JSONL with a preliminary step  
+**Architecture:** AWS S3 storage + Declarative Lakehouse Tables Pipeline on Databricks
+
+---
+
+## Table of Contents
+
+1. [Project Overview](#project-overview)
+2. [Architecture & Data Flow](#architecture--data-flow)
+3. [Repository Structure](#repository-structure)
+4. [Pipeline Layers](#pipeline-layers)
+5. [Raw Positions Transformation Steps](#raw-positions-transformation-steps)
+6. [Bronze Transformation Steps](#bronze-transformation-steps)
+7. [Silver Transformation Steps](#silver-transformation-steps)
+8. [Gold Possession Zones — Transformation Steps](#gold-possession-zones--transformation-steps)
+9. [Key Concepts](#key-concepts)
+10. [Glossary](#glossary)
+
+---
+
+## Project Overview
+
+This project processes football tracking data from the 2022-2023 Bundesliga season to analyze **possession zone transitions** — how the ball moves between pitch zones while a team is in possession. The pipeline transforms raw JSONL tracking data (25 FPS, \~23.7M rows across 7 matches) through bronze, silver, and gold layers, producing zone-level possession sequences with team and opponent metrics.
+
+Each match contains \~3.4M tracking rows covering players, ball, and referees with X/Y/Z positions, speed, distance, acceleration, and ball possession status at every frame.
+
+---
+
+## Architecture & Data Flow
+
+```
+S3 (JSONL/XML)
+    │
+    ▼
+┌─────────────────┐     ┌──────────────────┐
+│  raw_positions   │     │  match_info       │
+│  (15 cols)       │     │  (match metadata) │
+│  23.7M rows      │     │  7 rows           │
+└────────┬────────┘     └────────┬─────────┘
+         │                        │
+         ▼                        ▼
+┌─────────────────────────────────────┐
+│  bronze_positions (36 cols)          │
+│  + attacking_direction               │
+│  + x_norm / y_norm (attack-normalized)│
+│  + ball_distance                     │
+│  + pitch_zone / zone_id (9-cell grid)│
+│  + prev_* (lag window, 15 cols)      │
+└────────────────┬────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────┐
+│  silver_positions (16 cols)          │
+│  + players (struct array, sorted)    │
+│  + offside_line / offside_line_perc │
+│  + play_state (active/interruption)  │
+│  + has_possession (boolean)          │
+│  + possession_zone (mirrored)        │
+│  + ball_distance_target              │
+│  + weight / frame_score              │
+└────────────────┬────────────────────┘
+                 │
+         ┌───────┴────────┐
+         ▼                ▼
+┌──────────────┐  ┌────────────────────┐
+│ gold_pos-    │  │ gold_possession_    │
+│ sessions_all │  │ zones (16 cols)    │
+│ (11 cols)    │  │ + team_metrics      │
+│ possession   │  │ + opponent_metrics   │
+│ sequences    │  │ zone-level sequences│
+└──────────────┘  └────────────────────┘
+```
+
+**Compute:** Databricks Serverless (Spark)  
+**Pipeline:** Lakeflow Spark Declarative Pipelines (SDP) with `@dp.materialized_view` decorators  
+**Partitioning:** All tables partitioned by `match_id` for efficient per-match queries
+
+---
+
+## Repository Structure
+
+```
+soccer-pitch-zone-transition-batch-mode/
+├── README.md
+├── notebooks/
+│   ├── raw_positions.ipynb          # JSONL → Delta table (15 cols)
+│   ├── match_information.ipynb      # XML match metadata → Delta table
+│   ├── bronze_positions.ipynb       # Bronze enrichment (36 cols)
+│   ├── silver_positions.ipynb       # Silver grouping & metrics (16 cols)
+│   ├── gold_play_state.ipynb        # Gold possession & zone sequences
+│   └── raw_events.ipynb             # Event data loading
+└── pipeline/transformations/
+    ├── bronze/
+    │   └── bronze_positions.py      # SDP materialized view
+    ├── silver/
+    │   └── silver_positions.py      # SDP materialized view
+    └── gold/
+        ├── gold_possessions_all.py  # Possession sequences (all play states)
+        ├── gold_possession_zones.py # Zone-level sequences with metrics
+        └── gold_possession_streaks.py  # Deprecated (superseded)
+```
+
+---
+
+## Pipeline Layers
+
+| Layer | Table | Cols | Rows | Purpose |
+| --- | --- | --- | --- | --- |
+| Raw | `batch.raw_positions` | 15 | 23,739,462 | Tracking data from S3 JSONL (25 FPS) |
+| Raw | `batch.match_info` | 20+ | 7 | Match metadata (teams, pitch dims, weather) |
+| Bronze | `batch.bronze_positions` | 36 | 23,739,068 | Attack-normalized coords, pitch zones, prev-frame |
+| Silver | `batch.silver_positions` | 16 | 3,007,890 | Grouped per team/frame with possession metrics |
+| Gold | `batch.gold_possessions_all` | 11 | 2,861 | Team possession sequences (all play states) |
+| Gold | `batch.gold_possession_zones` | 16 | 9,095 | Zone-level sequences with team/opponent structs |
+
+---
 
 ## Raw Positions Transformation Steps
 
@@ -45,6 +160,8 @@ Source: `s3://bundesliga-2022-2023-data/timemajor/*.jsonl` (7 files, one per mat
 * `Frame.N` is not loaded — `frame_id` (from `n`) is the sole frame identifier
 * \~23.7M rows across 7 matches, \~3.4M rows per match
 
+---
+
 ## Bronze Transformation Steps
 
 Input: `raw_positions` (15 columns, \~23.7M rows) → Output: `bronze_positions` (36 columns, \~23.7M rows)
@@ -70,6 +187,8 @@ Input: `raw_positions` (15 columns, \~23.7M rows) → Output: `bronze_positions`
 | 19 | `ball_distance` | double | Step 5 — Euclidean distance to ball |
 | 20–21 | `pitch_zone`, `zone_id` | string, int | Step 6 — 9-cell pitch classification |
 | 22–36 | `prev_*` (15 cols) | various | Step 7 — lag() window, nullified on gaps |
+
+---
 
 ## Silver Transformation Steps
 
@@ -100,6 +219,8 @@ Input: `bronze_positions` (36 columns, \~23.7M rows) → Output: `silver_positio
 | 12–13 | `ball_distance_target`, `prev_ball_distance_target` | double | Step 8 — Euclidean to goal, window-propagated |
 | 14–15 | `weight_ball_distance_target`, `prev_weight_ball_distance_target` | double | Step 8 — inverse distance `1/(1+d)` |
 | 16 | `frame_score` | double | Step 8 — weight diff (current − prev) |
+
+---
 
 ## Gold Possession Zones — Transformation Steps
 
@@ -137,3 +258,57 @@ Input: `silver_positions` (16 columns, \~3M rows) → Output: `gold_possession_z
 | 14 | `interruption_frames` | long | Step 4 — play_state = interruption count |
 | 15 | `team_metrics` | struct | Step 8 — possession_zone, cumulative_score, min_ball_distance_target, avg_ball_speed, avg_offside_line, avg_offside_line_perc |
 | 16 | `opponent_metrics` | struct | Step 8 — opponent's mirrored metrics |
+
+---
+
+## Key Concepts
+
+### Attack-Normalized Coordinates (`x_norm`, `y_norm`)
+
+Raw tracking coordinates are **absolute** — teams physically switch ends at halftime, so a player's X position flips sign between halves. To make all analysis direction-agnostic, the bronze layer computes `x_norm` and `y_norm` where `0` always represents the possessing team's own goal and `pitch_dim` represents the opponent's goal. This is done by detecting each team's **attacking direction** (`+1` or `-1`) from the goalkeeper's average X position in the first 200 frames of each half.
+
+### 9-Cell Pitch Zone Classification (`pitch_zone`, `zone_id`)
+
+The pitch is divided into a 3×3 grid based on attack-normalized coordinates:
+
+| | Left | Centre | Right |
+| --- | --- | --- | --- |
+| **Final-third** (70–105) | `final-third_left` (7) | `final-third_centre` (8) | `final-third_right` (9) |
+| **Second-third** (35–70) | `second-third_left` (4) | `second-third_centre` (5) | `second-third_right` (6) |
+| **First-third** (0–35) | `first-third_left` (1) | `first-third_centre` (2) | `first-third_right` (3) |
+
+For the opponent team, zones are **mirrored**: first-third ↔ final-third, left ↔ right.
+
+### Frame Score & Weighted Ball Distance
+
+The `frame_score` measures how much the ball approached or retreated from the attacking target goal (105, 34) in a single frame:
+
+- `ball_distance_target` — Euclidean distance from the ball to the goal target
+- `weight = 1 / (1 + distance)` — inverse distance (closer = higher weight)
+- `frame_score = weight - prev_weight` — positive when approaching, negative when retreating
+
+The score is **not specular** between teams because the weight function `1/(1+d)` is convex: teams closer to their target get larger weight changes for the same distance delta.
+
+### Gaps-and-Islands Pattern
+
+Consecutive frames with the same `possession_zone` and `team_id` are grouped into sequences using the classic gaps-and-islands technique: `row_number()` over the full partition minus `row_number()` over the sub-partition (zone + team) produces a constant `group_id` for each consecutive run. Breaks occur when the ball moves to a different zone or possession changes hands.
+
+### `possession_id` vs `stage_id`
+
+- `possession_id` — increments via `lag()` whenever `team_id` changes between consecutive zone sequences (identifies which team's overall possession this zone belongs to)
+- `stage_id` — simple `row_number()` per match+section ordered by `start_frame` (sequential zone number within a half)
+
+---
+
+## Glossary
+
+| Term | Definition |
+| --- | --- |
+| **Frame** | One snapshot of tracking data at 25 FPS. Identified by `frame_id` (from JSONL field `n`). |
+| **Entity** | Any tracked object: player, ball, or referee. Identified by `team_id` + `person_id`. |
+| **Attacking direction** | `+1` = attacks left-to-right, `-1` = attacks right-to-left. Determined by goalkeeper position. |
+| **Offside line** | The second-lowest `x_norm` among outfield players (the first outfield player's position). `players[1].x_norm` after sorting by `x_norm` ascending. |
+| **Play state** | `active` (ball in play, `ball_status=1`) or `interruption` (ball dead, `ball_status=0`). |
+| **Possession zone** | The pitch zone where the ball is located, from the perspective of the possessing team. Mirrored for the opponent. |
+| **SDP** | Lakeflow Spark Declarative Pipelines — Databricks pipeline framework using `@dp.materialized_view` decorators. |
+| **Gaps-and-islands** | SQL pattern for grouping consecutive rows sharing a property, using `row_number()` difference. |
